@@ -1493,6 +1493,9 @@ process_if_status_change(interface_t *ifp)
 	tracking_vrrp_t *tvp;
 	bool now_up = FLAGS_UP(ifp->ifi_flags);
 
+	if (now_up)
+		ifp->seen_up = true;
+
 	/* The state of the interface has changed from up to down or vice versa.
 	 * Find which vrrp instances are affected */
 	LIST_FOREACH(ifp->tracking_vrrp, tvp, e) {
@@ -1521,28 +1524,15 @@ process_if_status_change(interface_t *ifp)
 	}
 }
 
+
 static void
-update_interface_flags(interface_t *ifp, unsigned ifi_flags)
+process_interface_flags_change(interface_t *ifp, unsigned ifi_flags)
 {
-	bool was_up, now_up;
+	bool now_up = FLAGS_UP(ifi_flags);
 
-	if (ifi_flags == ifp->ifi_flags)
-		return;
-
-	if (!vrrp_data)
-		return;
-
-	/* We get called after a VMAC is created, but before tracking_vrrp is set */
-
-	/* For an interface to be really up, any underlying interface must also be up */
-	was_up = IF_FLAGS_UP(ifp);
-	now_up = FLAGS_UP(ifi_flags);
 	ifp->ifi_flags = ifi_flags;
 
-	if (was_up == now_up)
-		return;
-
-	if (ifp->tracking_vrrp) {
+	if (!LIST_ISEMPTY(ifp->tracking_vrrp)) {
 		log_message(LOG_INFO, "Netlink reports %s %s", ifp->ifname, now_up ? "up" : "down");
 
 		process_if_status_change(ifp);
@@ -1552,6 +1542,74 @@ update_interface_flags(interface_t *ifp, unsigned ifi_flags)
 		interface_down(ifp);
 	else
 		interface_up(ifp);
+}
+
+static void
+delayed_if_flags_change_thread(thread_ref_t thread)
+{
+/* what if interface has been deleted, name changed, etc? */
+	interface_t *ifp = (interface_t *) thread->arg;
+
+	ifp->flags_change_thread = NULL;
+
+	process_interface_flags_change(ifp, thread->u.val);
+}
+
+static void
+update_interface_flags(interface_t *ifp, unsigned ifi_flags, bool immediate)
+{
+	bool was_up, now_up;
+	unsigned debounce_timer;
+
+	if (ifi_flags == ifp->ifi_flags || immediate) {
+		if (ifp->flags_change_thread) {
+			thread_cancel(ifp->flags_change_thread);
+			ifp->flags_change_thread = NULL;
+		}
+		if (!immediate)
+			return;
+	}
+
+	if (!vrrp_data)
+		return;
+
+	/* We get called after a VMAC is created, but before tracking_vrrp is set */
+
+	/* For an interface to be really up, any underlying interface must also be up */
+	was_up = IF_FLAGS_UP(ifp);
+	now_up = FLAGS_UP(ifi_flags);
+	if (ifp->flags_change_thread) {
+		if (ifi_flags == ifp->flags_change_thread->u.uval)
+			return;
+
+		/* If up/down status is same as last pending status change,
+		 * just update the thread's version of the interface state */
+		if (FLAGS_UP(ifp->flags_change_thread->u.uval) == now_up) {
+			thread_arg2 u = { .uval = ifi_flags };
+
+			thread_update_arg2(ifp->flags_change_thread, &u);
+			return ;
+		}
+
+		thread_cancel(ifp->flags_change_thread);
+		ifp->flags_change_thread = NULL;
+		log_message(LOG_INFO, "Delay timer for %s cancelled", ifp->ifname);
+	}
+
+	if (was_up == now_up)
+		return;
+
+	debounce_timer = now_up ? ifp->up_debounce_timer : ifp->down_debounce_timer;
+	if (ifp->seen_up && debounce_timer && !immediate) {
+		ifp->flags_change_thread = thread_add_timer_uval(master, delayed_if_flags_change_thread, ifp, ifi_flags, debounce_timer);
+		log_message(LOG_INFO, "%s: Adding flags change from 0x%x to 0x%x delay by %u", ifp->ifname, ifp->ifi_flags, ifi_flags, debounce_timer);
+		return;
+	}
+
+	if (now_up)
+		ifp->seen_up = true;
+
+	process_interface_flags_change(ifp, ifi_flags);
 }
 
 static const char *
@@ -1817,6 +1875,8 @@ netlink_if_link_populate(interface_t *ifp, struct rtattr *tb[], struct ifinfomsg
 #endif
 
 	ifp->ifi_flags = ifi->ifi_flags;
+	if (FLAGS_UP(ifi->ifi_flags))
+		ifp->seen_up = true;
 
 	return true;
 }
@@ -1855,7 +1915,7 @@ netlink_if_link_filter(__attribute__((unused)) struct sockaddr_nl *snl, struct n
 		return -1;
 
 	if (ifp->ifindex)
-		update_interface_flags(ifp, ifi->ifi_flags);
+		update_interface_flags(ifp, ifi->ifi_flags, true);
 
 	return 0;
 }
@@ -1918,6 +1978,7 @@ netlink_link_filter(__attribute__((unused)) struct sockaddr_nl *snl, struct nlms
 	char mac_buf[3 * sizeof(ifp->hw_addr)];
 	char old_mac_buf[3 * sizeof(ifp->hw_addr)];
 	list old_tracking_vrrp;
+	bool immediate_change = false;
 
 	if (!(h->nlmsg_type == RTM_NEWLINK || h->nlmsg_type == RTM_DELLINK))
 		return 0;
@@ -1956,6 +2017,8 @@ netlink_link_filter(__attribute__((unused)) struct sockaddr_nl *snl, struct nlms
 			} else
 #endif
 				cleanup_lost_interface(ifp);
+
+			ifp->seen_up = false;
 
 #ifdef _HAVE_VRRP_VMAC_
 			/* If this was a vmac we created, create it again, so long as the underlying i/f exists */
@@ -2040,6 +2103,8 @@ netlink_link_filter(__attribute__((unused)) struct sockaddr_nl *snl, struct nlms
 				else
 #endif
 					ifp = NULL;	/* Set ifp to null, to force creating a new interface_t */
+
+				immediate_change = true;
 			} else if (ifp->ifindex) {
 #ifdef _HAVE_VRF_
 				/* Now check if the VRF info is changed */
@@ -2048,6 +2113,7 @@ netlink_link_filter(__attribute__((unused)) struct sockaddr_nl *snl, struct nlms
 					new_master_ifp = if_get_by_ifindex(new_master_index);
 				} else
 					new_master_ifp = NULL;
+
 				if (new_master_ifp != ifp->vrf_master_ifp) {
 					ifp->vrf_master_ifp = new_master_ifp;
 					update_vmac_vrfs(ifp);
@@ -2062,7 +2128,7 @@ netlink_link_filter(__attribute__((unused)) struct sockaddr_nl *snl, struct nlms
 				    tb[IFLA_MTU]) {
 					old_mtu = ifp->mtu;
 					ifp->mtu = *(uint32_t *)RTA_DATA(tb[IFLA_MTU]);
-					if (!LIST_ISEMPTY(ifp->tracking_vrrp))
+					if (old_mtu != ifp->mtu && !LIST_ISEMPTY(ifp->tracking_vrrp))
 						update_mtu(ifp);
 				}
 
@@ -2130,7 +2196,7 @@ netlink_link_filter(__attribute__((unused)) struct sockaddr_nl *snl, struct nlms
 	}
 
 	/* Update flags. Flags == 0 means interface deleted. */
-	update_interface_flags(ifp, (h->nlmsg_type == RTM_DELLINK) ? 0 : ifi->ifi_flags);
+	update_interface_flags(ifp, (h->nlmsg_type == RTM_DELLINK) ? 0 : ifi->ifi_flags, immediate_change);
 
 	return 0;
 }
@@ -2487,5 +2553,6 @@ void
 register_keepalived_netlink_addresses(void)
 {
 	register_thread_address("kernel_netlink", kernel_netlink);
+	register_thread_address("delayed_if_flags_change_thread", delayed_if_flags_change_thread);
 }
 #endif

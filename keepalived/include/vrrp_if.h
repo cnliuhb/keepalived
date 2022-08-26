@@ -116,6 +116,10 @@ typedef struct _interface {
 	list			sin6_addr_l;		/* List of extra IPv6 interface addresses - struct in6_addr */
 #endif
 	unsigned		ifi_flags;		/* Kernel flags */
+	bool			seen_up;		/* True once we have first seen the interface up */
+	thread_ref_t		flags_change_thread;
+	unsigned		up_debounce_timer;
+	unsigned		down_debounce_timer;
 	uint32_t		mtu;			/* MTU for this interface_t */
 	unsigned short		hw_type;		/* Type of hardware address */
 	u_char			hw_addr[MAX_ADDR_LEN];	/* MAC address */
